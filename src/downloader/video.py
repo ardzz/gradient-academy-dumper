@@ -49,7 +49,7 @@ class VideoDownloader:
                                   ch.order_index as chapter_order,
                                   s.order_index  as subchapter_order
                            FROM courses c
-                                    JOIN chapters ch ON c.id = ch.course_id
+                                    JOIN chapters ch ON c.slug = ch.course_id
                                     JOIN subchapters s ON ch.id = s.chapter_id
                                     JOIN videos v ON s.id = v.subchapter_id
                            WHERE c.slug = ?
@@ -67,7 +67,7 @@ class VideoDownloader:
                                   c.slug,
                                   COUNT(DISTINCT v.id) as video_count
                            FROM courses c
-                                    JOIN chapters ch ON c.id = ch.course_id
+                                    JOIN chapters ch ON c.slug = ch.course_id
                                     JOIN subchapters s ON ch.id = s.chapter_id
                                     JOIN videos v ON s.id = v.subchapter_id
                            GROUP BY c.id
