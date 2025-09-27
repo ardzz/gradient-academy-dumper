@@ -1,9 +1,13 @@
 """Video downloader for Gradient Academy videos."""
 import subprocess
+import os
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
-from ..config import DOWNLOAD_PATH, FFMPEG_PATH
+from ..config import (
+    DOWNLOAD_PATH, FFMPEG_PATH, RCLONE_PATH, RCLONE_REMOTE,
+    RCLONE_DEST_DIR, RCLONE_ENABLED, DELETE_AFTER_UPLOAD
+)
 from ..db.manager import DatabaseManager
 from ..utils.console import console, create_progress
 
@@ -17,6 +21,8 @@ class VideoDownloader:
         self.output_path = Path(output_path) if output_path else DOWNLOAD_PATH
         self.output_path.mkdir(exist_ok=True, parents=True)
         self._check_ffmpeg()
+        if RCLONE_ENABLED:
+            self._check_rclone()
 
     def _check_ffmpeg(self):
         """Check if ffmpeg is available."""
@@ -30,6 +36,35 @@ class VideoDownloader:
         except FileNotFoundError:
             console.print("[bold red]Error:[/] ffmpeg not found!")
             console.print("Please install ffmpeg or set the correct path in .env with FFMPEG_PATH.")
+
+    def _check_rclone(self):
+        """Check if rclone is available and configured."""
+        try:
+            result = subprocess.run([RCLONE_PATH, "version"],
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE)
+            if result.returncode != 0:
+                console.print("[bold red]Warning:[/] rclone not found or not working properly.")
+                console.print("Please install rclone or set the correct path in .env with RCLONE_PATH.")
+                return False
+
+            # Check if the remote exists
+            result = subprocess.run([RCLONE_PATH, "listremotes"],
+                                     stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE,
+                                     text=True)
+
+            remote_name = RCLONE_REMOTE.rstrip(':') + ':'
+            if remote_name not in result.stdout:
+                console.print(f"[bold red]Warning:[/] rclone remote '{RCLONE_REMOTE}' not found.")
+                console.print("Please configure the remote using 'rclone config'.")
+                return False
+
+            return True
+        except FileNotFoundError:
+            console.print("[bold red]Error:[/] rclone not found!")
+            console.print("Please install rclone or set the correct path in .env with RCLONE_PATH.")
+            return False
 
     def get_course_videos(self, course_slug: str) -> List[Dict[str, Any]]:
         """Get all videos for a specific course."""
@@ -77,6 +112,40 @@ class VideoDownloader:
             courses = [dict(row) for row in cursor.fetchall()]
             return courses
 
+    def _upload_to_gdrive(self, local_path: Path, remote_path: str) -> bool:
+        """Upload a file or directory to Google Drive using rclone."""
+        if not RCLONE_ENABLED:
+            return False
+
+        try:
+            # Ensure the remote path exists
+            console.print(f"[cyan]Uploading to Google Drive:[/] {remote_path}")
+
+            cmd = [
+                RCLONE_PATH,
+                "copy",
+                "--progress",
+                str(local_path),
+                f"{RCLONE_REMOTE}{remote_path}"
+            ]
+
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+
+            if result.returncode != 0:
+                console.print(f"[red]Upload failed:[/] {result.stderr}")
+                return False
+
+            console.print(f"[green]Successfully uploaded to Google Drive:[/] {remote_path}")
+            return True
+        except Exception as e:
+            console.print(f"[red]Error uploading to Google Drive:[/] {e}")
+            return False
+
     def download_course_videos(self, course_slug: str):
         """Download all videos for a course."""
         videos = self.get_course_videos(course_slug)
@@ -92,6 +161,9 @@ class VideoDownloader:
         # Create course directory
         course_dir = self.output_path / self._sanitize_filename(course_slug)
         course_dir.mkdir(exist_ok=True)
+
+        # Create remote path for Google Drive
+        gdrive_course_path = f"{RCLONE_DEST_DIR}/{self._sanitize_filename(course_slug)}"
 
         # Download each video
         progress = create_progress()
@@ -113,9 +185,24 @@ class VideoDownloader:
                 filename = f"{subchapter_order:02d}_{self._sanitize_filename(subchapter_name)}.mp4"
                 output_path = chapter_dir / filename
 
+                # Remote path for this video
+                gdrive_chapter_path = f"{gdrive_course_path}/{chapter_dir_name}"
+                gdrive_video_path = f"{gdrive_chapter_path}/{filename}"
+
                 # Skip if already downloaded
                 if output_path.exists():
                     console.print(f"[yellow]Skipping existing file:[/] {output_path}")
+
+                    # If rclone is enabled and file exists, upload it and potentially delete it
+                    if RCLONE_ENABLED:
+                        upload_success = self._upload_to_gdrive(output_path, gdrive_chapter_path)
+                        if upload_success and DELETE_AFTER_UPLOAD:
+                            try:
+                                output_path.unlink()
+                                console.print(f"[blue]Deleted local file after upload:[/] {filename}")
+                            except Exception as e:
+                                console.print(f"[red]Error deleting file after upload:[/] {e}")
+
                     progress.update(task, advance=1)
                     continue
 
@@ -124,12 +211,25 @@ class VideoDownloader:
 
                 if success:
                     console.print(f"[green]Downloaded:[/] {subchapter_name}")
+
+                    # If rclone is enabled, upload the video
+                    if RCLONE_ENABLED:
+                        upload_success = self._upload_to_gdrive(output_path, gdrive_chapter_path)
+                        if upload_success and DELETE_AFTER_UPLOAD:
+                            try:
+                                output_path.unlink()
+                                console.print(f"[blue]Deleted local file after upload:[/] {filename}")
+                            except Exception as e:
+                                console.print(f"[red]Error deleting file after upload:[/] {e}")
                 else:
                     console.print(f"[red]Failed to download:[/] {subchapter_name}")
 
                 progress.update(task, advance=1)
 
         console.print(f"[bold green]Download complete! Videos saved to:[/] {course_dir}")
+
+        if RCLONE_ENABLED:
+            console.print(f"[bold green]Videos also available in Google Drive:[/] {gdrive_course_path}")
 
     def _download_video(self, video: Dict[str, Any], output_path: Path) -> bool:
         """Download a video using ffmpeg."""
