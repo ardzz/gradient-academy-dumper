@@ -133,13 +133,88 @@ def download_videos(course_slug: str = None, output_path: str = None):
         downloader.download_course_videos(course_slug)
 
 
+def rescrape_course_videos(course_slug: str = None):
+    """Rescrape video information for a course when tokens have expired."""
+    console.print("[bold blue]Rescraping video information...[/]")
+
+    with DatabaseManager() as db, GradientClient() as api:
+        # Create scrapers
+        subchapter_scraper = SubchapterScraper(db, api)
+
+        if not course_slug:
+            # List available courses
+            conn = db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT c.course_name, c.slug, 
+                       COUNT(DISTINCT ch.id) as chapters
+                FROM courses c
+                LEFT JOIN chapters ch ON c.slug = ch.course_id
+                GROUP BY c.id
+                ORDER BY c.course_name
+            """)
+
+            courses = [dict(row) for row in cursor.fetchall()]
+
+            if not courses:
+                console.print("[yellow]No courses found in the database.[/]")
+                return
+
+            print_table("Available Courses", courses, ["course_name", "slug", "chapters"])
+
+            # Ask user to select a course
+            course_slug = console.input("\n[bold cyan]Enter course slug to rescrape: [/]")
+            if not course_slug:
+                console.print("[yellow]No course selected. Exiting.[/]")
+                return
+
+        # Get all subchapters for this course
+        conn = db.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT s.id, s.subchapter_slug, ch.id as chapter_id
+            FROM courses c
+            JOIN chapters ch ON c.slug = ch.course_id
+            JOIN subchapters s ON ch.id = s.chapter_id
+            WHERE c.slug = ?
+            ORDER BY ch.order_index, s.order_index
+        """, (course_slug,))
+
+        subchapters = [dict(row) for row in cursor.fetchall()]
+
+        if not subchapters:
+            console.print(f"[yellow]No subchapters found for course: {course_slug}[/]")
+            return
+
+        console.print(f"[green]Found {len(subchapters)} subchapters to rescrape for course: {course_slug}[/]")
+
+        # Track progress
+        updated_count = 0
+
+        # Process each subchapter to refresh video information
+        for subchapter in subchapters:
+            subchapter_slug = subchapter.get('subchapter_slug')
+
+            # Rescrape the subchapter details to get fresh video information
+            detail = subchapter_scraper.scrape_subchapter_detail(course_slug, subchapter_slug)
+
+            if detail and detail.get('video'):
+                updated_count += 1
+                console.print(f"[green]Updated video information for:[/] {subchapter_slug}")
+            else:
+                console.print(f"[yellow]No video information found for:[/] {subchapter_slug}")
+
+        console.print(f"[bold green]Rescraping completed! Updated {updated_count} videos.[/]")
+
+
 def main():
     """Main function."""
     parser = argparse.ArgumentParser(description="Gradient Academy Scraper")
     parser.add_argument('--stats', action='store_true', help='Show database statistics')
     parser.add_argument('--scrape', action='store_true', help='Scrape all data')
     parser.add_argument('--download', action='store_true', help='Download videos from courses')
-    parser.add_argument('--course', type=str, help='Course slug to download (optional)')
+    parser.add_argument('--rescrape-videos', action='store_true', help='Rescrape video information for a course (useful when tokens expire)')
+    parser.add_argument('--course', type=str, help='Course slug to download or rescrape (optional)')
     parser.add_argument('--output', type=str, help='Output directory for downloads (optional)')
     args = parser.parse_args()
 
@@ -161,6 +236,12 @@ def main():
             console.print("[yellow]Database doesn't exist yet. Run --scrape first.[/]")
         else:
             download_videos(args.course, args.output)
+    elif args.rescrape_videos:
+        if not db_exists:
+            console.print("[yellow]Database doesn't exist yet. Run --scrape first.[/]")
+        else:
+            check_token()
+            rescrape_course_videos(args.course)
     else:
         parser.print_help()
 
